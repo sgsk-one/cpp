@@ -1,32 +1,10 @@
-// xeon_profiler_refactored.cpp
-// Reusable perf-based profiler class for Intel Xeon (Gold) that:
-//   - samples BOTH time (ns, TASK/CPU clock) and HW cycles concurrently
-//   - uses LBR call-graph (BRANCH_CALL_STACK) when available, else CALLCHAIN (FP)
-//   - supports scope = current thread OR whole process (inherit threads)
-//   - aggregates by function (demangled, module-prefixed) + collapsed stacks output
-//   - emits a detailed top table (time, cycles, %, cycles/ns) to any std::ostream
-//
-// Public API (see main() below for usage):
-//
-//   XeonProfiler::Options opt{...};
-//   XeonProfiler prof(opt);
-//   if (!prof.setup()) { /* handle error */ }
-//   prof.start();
-//   your_hot_code();
-//   prof.stop();
-//   prof.report(std::cout);
-//   prof.write_collapsed(opt.outfile);   // optional
+// xeon_profiler_dwfl.cpp
+// Perf-based programmatic profiler for Intel Xeon Gold with DWARF symbolization (libdwfl).
+// This version includes a highly robust func_key() for stable function aggregation.
 //
 // Build:
-//   g++ -O2 -std=c++20 -fno-omit-frame-pointer -rdynamic xeon_profiler_refactored.cpp -ldl -o xeon_profiler_refactored
-//
-// Notes:
-//   * Default time source is TASK_CLOCK (on-CPU task time) which tracks “where CPU time goes”.
-//   * For accurate frame-pointer fallback, compile your app with -fno-omit-frame-pointer.
-//   * If LBR is blocked (VM/BIOS/policy), the class auto-falls back to CALLCHAIN.
-//   * If you include kernel time, you may need: sudo sysctl kernel.perf_event_paranoid=1
-//
-// License: do whatever you want; attribution appreciated.
+//   g++ -O2 -std=c++20 -fno-omit-frame-pointer \
+//       xeon_profiler_dwfl.cpp -ldw -lelf -ldl -o xeon_profiler_dwfl
 
 #define _GNU_SOURCE
 #include <linux/perf_event.h>
@@ -50,11 +28,12 @@
 #include <string_view>
 #include <algorithm>
 #include <optional>
-#include <dlfcn.h>
-#include <cxxabi.h>
 #include <chrono>
 
-// ---------- tiny helpers ----------
+#include <dlfcn.h>
+#include <cxxabi.h>
+#include <elfutils/libdwfl.h>
+
 static int perf_event_open(perf_event_attr* attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(SYS_perf_event_open, attr, pid, cpu, group_fd, flags);
 }
@@ -72,34 +51,264 @@ static std::string basename_of(const char* path) {
     return slash ? std::string(slash + 1) : std::string(path);
 }
 
-// ---------- XeonProfiler (drop-in class) ----------
+// --------------------- DWARF Symbolizer (libdwfl) ---------------------
+class DwflSymbolizer {
+public:
+    DwflSymbolizer() : dwfl_(nullptr) {}
+    ~DwflSymbolizer() { if (dwfl_) dwfl_end(dwfl_); }
+
+    bool init_for_self() {
+        Dwfl_Callbacks cb{};
+        cb.find_elf       = dwfl_linux_proc_find_elf;
+        cb.find_debuginfo = dwfl_standard_find_debuginfo; // .gnu_debuglink, build-id, DEBUGINFOD_URLS
+        dwfl_ = dwfl_begin(&cb);
+        if (!dwfl_) return false;
+        if (dwfl_linux_proc_report(dwfl_, getpid()) != 0) return false;
+        if (dwfl_report_end(dwfl_, nullptr, nullptr) != 0) return false;
+        return true;
+    }
+
+    // Human-readable frame label "module!function+0xOFF" for stacks.
+    std::string frame_label(uint64_t ip) const {
+        if (!dwfl_) return hex_addr_(ip);
+        Dwfl_Module* mod = dwfl_addrmodule(dwfl_, (Dwarf_Addr)ip);
+        const char* modname = module_name_(mod);
+        std::string mshort = mod_basename_(modname);
+
+        // Prefer function symbol
+        std::string canon = function_name_with_offset_(mod, ip, /*want_offset=*/true);
+        if (!canon.empty()) return mshort.empty() ? canon : (mshort + "!" + canon);
+
+        // Fallback: module!0xADDR
+        if (!mshort.empty()) return mshort + "!" + hex_addr_(ip);
+        return hex_addr_(ip);
+    }
+
+    // ======= ROBUST FUNCTION KEY =======
+    //
+    // Returns a canonical aggregation key "module!function" with:
+    //  - DWARF/symtab based resolution
+    //  - demangling
+    //  - normalization of compiler suffixes (.cold/.isra/.constprop/.part/.clone/.llvm/plt/@plt/etc.)
+    //  - no +offset
+    //  - stable grouping for PLT/IFUNC stubs
+    //
+    std::string func_key(uint64_t ip) const {
+        if (!dwfl_) return fallback_func_key_(ip);
+
+        // Cache
+        auto it = cache_.find(ip);
+        if (it != cache_.end()) return it->second;
+
+        Dwfl_Module* mod = dwfl_addrmodule(dwfl_, (Dwarf_Addr)ip);
+        const char* modname = module_name_(mod);
+        std::string mshort = mod_basename_(modname);
+
+        // Step 1: Resolve containing function symbol using addrinfo (strongest)
+        std::string fname;
+        if (mod) {
+            const char* nm_via_addrname = dwfl_module_addrname(mod, (Dwarf_Addr)ip);
+            if (nm_via_addrname && *nm_via_addrname) {
+                fname = demangle(nm_via_addrname);
+            }
+
+            // Try to nail the defining symbol (gives us start address & avoids PLT thunks)
+            GElf_Sym sym{}; GElf_Off symoff = 0;
+            if (dwfl_module_addrinfo(mod, (Dwarf_Addr)ip, &sym, &symoff, nullptr, nullptr, nullptr) == 0) {
+                // Prefer st_name if available; sometimes addrname returns section names/aliases
+                if (sym.st_name) {
+                    const char* tabnm = dwfl_module_getsym_info(mod, GELF_ST_BIND(sym.st_info), &sym, nullptr, nullptr, nullptr, nullptr)
+                                        ? nullptr : nullptr; // placeholder; we already have 'sym'
+                    // dwfl doesn't directly give the name here; use addrname again for user-facing,
+                    // but we already have one in fname. Keep as-is.
+                }
+            }
+        }
+
+        // Step 2: Canonicalize the function name aggressively
+        std::string canon_func = canonicalize_function_(fname);
+
+        // If still empty, fall back to module!0xADDR (stable grouping by module)
+        std::string key;
+        if (!canon_func.empty()) {
+            key = mshort.empty() ? canon_func : (mshort + "!" + canon_func);
+        } else {
+            key = mshort.empty() ? hex_addr_(ip) : (mshort + "!" + hex_addr_(ip));
+        }
+
+        cache_.emplace(ip, key);
+        return key;
+    }
+
+private:
+    Dwfl* dwfl_;
+    mutable std::unordered_map<uint64_t, std::string> cache_;
+
+    static const char* module_name_(Dwfl_Module* mod) {
+        if (!mod) return nullptr;
+        return dwfl_module_info(mod, nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr);
+    }
+    static std::string mod_basename_(const char* modname) {
+        if (!modname) return {};
+        // Normalize special maps like [vdso], [kernel.kallsyms], [anon], etc.
+        if (modname[0] == '[') return std::string(modname); // keep bracketed names as-is
+        return basename_of(modname);
+    }
+    static std::string hex_addr_(uint64_t ip) {
+        char b[32]; std::snprintf(b, sizeof(b), "0x%llx", (unsigned long long)ip);
+        return b;
+    }
+
+    // Return demangled function + optional +offset.
+    std::string function_name_with_offset_(Dwfl_Module* mod, uint64_t ip, bool want_offset) const {
+        std::string out;
+        if (!mod) return out;
+
+        const char* nm = dwfl_module_addrname(mod, (Dwarf_Addr)ip);
+        if (nm && *nm) out = demangle(nm);
+
+        // If requested, append +offset within symbol
+        GElf_Sym sym{}; GElf_Off symoff;
+        if (dwfl_module_addrinfo(mod, (Dwarf_Addr)ip, &sym, &symoff, nullptr, nullptr, nullptr) == 0) {
+            if (want_offset && sym.st_value && (uint64_t)ip > sym.st_value) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "+0x%llx",
+                              (unsigned long long)((uint64_t)ip - (uint64_t)sym.st_value));
+                out += buf;
+            }
+        }
+        return out;
+    }
+
+    // ---- Canonicalization helpers for function names ----
+    static inline void erase_suffix(std::string& s, std::string_view sv) {
+        if (s.size() >= sv.size() && s.compare(s.size()-sv.size(), sv.size(), sv) == 0) {
+            s.erase(s.size()-sv.size());
+        }
+    }
+    static inline void remove_all(std::string& s, std::string_view what) {
+        for (;;) {
+            auto p = s.find(what);
+            if (p == std::string::npos) break;
+            s.erase(p, what.size());
+        }
+    }
+    static inline void strip_after(std::string& s, char ch) {
+        auto p = s.find(ch);
+        if (p != std::string::npos) s.resize(p);
+    }
+
+    // Heuristically strip compiler/linker clutter to get a *stable* function identity.
+    static std::string canonicalize_function_(std::string name) {
+        if (name.empty()) return name;
+
+        // Drop any offset suffix produced upstream (just in case).
+        strip_after(name, '+'); // remove "+0x…"
+
+        // Normalize common GCC/Clang/Glibc suffixes:
+        static const std::string kill_suffixes[] = {
+            ".cold", ".part", ".clone", ".plt", "._plt", "@plt",
+            // OMP/outlined
+            ".__omp_outlined__", ".__omp_outlined.", "._omp_fn.", "._omp_fn",
+            // GCC transforms
+            ".isra.", ".constprop.", ".constprop", ".isra", ".llvm.", ".lto_priv.", ".lto_priv",
+            // thunk-like markers (various toolchains)
+            ".thunk", "_thunk", " thunk"
+        };
+        for (const auto& k : kill_suffixes) {
+            // Remove occurrences anywhere (safer than only trailing)
+            remove_all(name, k);
+        }
+
+        // Remove GLIBC/GLIBCXX version suffixes on C symbols if any made it through demangle
+        strip_after(name, '@');
+
+        // Trim whitespace if any artifacts
+        while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+
+        return name;
+    }
+
+    // Last-resort key if DWFL failed: try module via dladdr, then address.
+    static std::string fallback_func_key_(uint64_t ip) {
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(ip), &info) && info.dli_fname) {
+            std::string mod = basename_of(info.dli_fname);
+            char b[32]; std::snprintf(b, sizeof(b), "0x%llx", (unsigned long long)ip);
+            return mod.empty() ? std::string(b) : (mod + "!" + b);
+        }
+        char b[32]; std::snprintf(b, sizeof(b), "0x%llx", (unsigned long long)ip);
+        return b;
+    }
+};
+
+// --------------------- Ring Buffer ---------------------
+struct PerfRB {
+    int fd{-1};
+    void* base{nullptr};
+    size_t pg{size_t(sysconf(_SC_PAGESIZE))};
+    size_t n_pages{512};
+    perf_event_mmap_page* meta{nullptr};
+    uint8_t* data{nullptr};
+    size_t data_sz{0};
+
+    bool map() {
+        size_t map_sz = (n_pages + 1) * pg;
+        void* p = mmap(nullptr, map_sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (p == MAP_FAILED) { perror("mmap"); return false; }
+        base = p; meta = reinterpret_cast<perf_event_mmap_page*>(base);
+        data = reinterpret_cast<uint8_t*>(base) + pg;
+        data_sz = n_pages * pg;
+        return true;
+    }
+    void unmap() {
+        if (!base) return;
+        munmap(base, (n_pages + 1) * pg);
+        base = nullptr; meta = nullptr; data = nullptr; data_sz = 0;
+    }
+    uint64_t head() const { uint64_t h = meta->data_head; __sync_synchronize(); return h; }
+    void set_tail(uint64_t t) { __sync_synchronize(); meta->data_tail = t; }
+};
+
+// --------------------- Hash helpers ---------------------
+struct HashVec {
+    size_t operator()(const std::vector<uint64_t>& v) const {
+        size_t h = 1469598103934665603ull;
+        for (auto x : v) { h ^= x + 0x9e3779b97f4a7c15ull + (h<<6) + (h>>2); }
+        return h;
+    }
+};
+struct EqVec {
+    bool operator()(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) const { return a == b; }
+};
+
+// --------------------- Profiler (drop-in class) ---------------------
 class XeonProfiler {
 public:
     struct Options {
         enum class Scope { Thread, Process } scope = Scope::Thread;
-        int   freq_hz         = 2000;   // sampling frequency
-        bool  include_kernel  = false;  // default user-only
-        bool  force_no_lbr    = false;  // force FP callchain
-        bool  time_task_clock = true;   // TASK_CLOCK (on-CPU task time) vs CPU_CLOCK
-        int   top_n           = 25;     // rows in report
-        std::string collapsed_out = "stacks.collapsed"; // output for FlameGraph (time-weighted)
+        int   freq_hz         = 2000;
+        bool  include_kernel  = false;
+        bool  force_no_lbr    = false;
+        bool  time_task_clock = true;   // TASK_CLOCK vs CPU_CLOCK
+        int   top_n           = 25;
+        std::string collapsed_out = "stacks.collapsed";
     };
 
     explicit XeonProfiler(const Options& opt) : opt_(opt) {}
 
-    // Prepare both streams (time+cycles). Returns false if neither can open.
     bool setup() {
-        // attachment
+        if (!dwfl_.init_for_self()) {
+            std::cerr << "[warn] Failed to initialize libdwfl; symbol names may be poorer.\n";
+        }
         attach_pid_ = (opt_.scope == Options::Scope::Process ? getpid() : 0);
         attach_cpu_ = -1;
         inherit_    = (opt_.scope == Options::Scope::Process);
 
-        // try open time stream
         if (!time_.open(StreamKind::TimeNS, !opt_.force_no_lbr,
                         !opt_.include_kernel, inherit_, opt_.freq_hz,
                         attach_pid_, attach_cpu_, opt_.time_task_clock)) {
-            // retry without LBR
-            if (!time_.open(StreamKind::TimeNS, /*use_lbr=*/false,
+            if (!time_.open(StreamKind::TimeNS, false,
                             !opt_.include_kernel, inherit_, opt_.freq_hz,
                             attach_pid_, attach_cpu_, opt_.time_task_clock)) {
                 perror("perf_event_open(time)");
@@ -110,12 +319,10 @@ public:
             }
         }
 
-        // try open cycle stream
         if (!cycles_.open(StreamKind::Cycles, !opt_.force_no_lbr,
                           !opt_.include_kernel, inherit_, opt_.freq_hz,
                           attach_pid_, attach_cpu_, /*time_task*/ true)) {
-            // retry without LBR
-            if (!cycles_.open(StreamKind::Cycles, /*use_lbr=*/false,
+            if (!cycles_.open(StreamKind::Cycles, false,
                               !opt_.include_kernel, inherit_, opt_.freq_hz,
                               attach_pid_, attach_cpu_, /*time_task*/ true)) {
                 perror("perf_event_open(cycles)");
@@ -128,14 +335,11 @@ public:
         return true;
     }
 
-    // Begin measurement (enable both streams); also captures wall-clock start.
     void start() {
         t0_ = std::chrono::steady_clock::now();
         time_.enable();
         cycles_.enable();
     }
-
-    // End measurement (disable streams); captures wall-clock end; drains buffers.
     void stop() {
         cycles_.disable();
         time_.disable();
@@ -143,9 +347,7 @@ public:
         drain_all_();
     }
 
-    // Print a detailed top table (functions) to any std::ostream.
     void report(std::ostream& os) {
-        // merge function maps
         struct Row { std::string fn; __uint128_t tns{0}; __uint128_t cyc{0}; };
         std::vector<Row> rows;
         rows.reserve(std::max(func_time_ns_.size(), func_cycles_.size()) + 8);
@@ -190,8 +392,8 @@ public:
         int shown = 0;
         for (const auto& r : rows) {
             if (shown++ >= opt_.top_n) break;
-            long double t = to_ld(r.tns);
-            long double c = to_ld(r.cyc);
+            long double t = (long double)r.tns;
+            long double c = (long double)r.cyc;
             long double pt = 100.0L * (t / total_ns);
             long double pc = 100.0L * (c / total_cy);
             long double cpn = (t > 0) ? (c / t) : 0.0L;
@@ -211,7 +413,6 @@ public:
            << ", cycles=" << (unsigned long long)total_cycles_ << "\n\n";
     }
 
-    // Emit FlameGraph-compatible collapsed stacks (time-weighted).
     bool write_collapsed(const std::string& path) {
         std::ofstream ofs(path);
         if (!ofs) { std::perror("open collapsed output"); return false; }
@@ -221,52 +422,18 @@ public:
             if (stk.empty()) continue;
             for (size_t i = 0; i < stk.size(); ++i) {
                 if (i) ofs << ';';
-                ofs << frame_label_(stk[i]);
+                ofs << dwfl_.frame_label(stk[i]);
             }
             ofs << ' ' << (unsigned long long)w << "\n";
         }
         return true;
     }
 
-    // (Optional) convenience: run a region with automatic start/stop.
-    template <class F>
-    void run(F&& func) {
-        start();
-        func();
-        stop();
-    }
-
+    template <class F> void run(F&& f) { start(); f(); stop(); }
     ~XeonProfiler() { time_.close_all(); cycles_.close_all(); }
 
 private:
-    // ---------- internal types ----------
     enum class StreamKind { TimeNS, Cycles };
-
-    struct PerfRB {
-        int fd{-1};
-        void* base{nullptr};
-        size_t pg{size_t(sysconf(_SC_PAGESIZE))};
-        size_t n_pages{512}; // larger because we run two streams
-        perf_event_mmap_page* meta{nullptr};
-        uint8_t* data{nullptr};
-        size_t data_sz{0};
-        bool map() {
-            size_t map_sz = (n_pages + 1) * pg;
-            void* p = mmap(nullptr, map_sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            if (p == MAP_FAILED) { perror("mmap"); return false; }
-            base = p; meta = reinterpret_cast<perf_event_mmap_page*>(base);
-            data = reinterpret_cast<uint8_t*>(base) + pg;
-            data_sz = n_pages * pg;
-            return true;
-        }
-        void unmap() {
-            if (!base) return;
-            munmap(base, (n_pages + 1) * pg);
-            base = nullptr; meta = nullptr; data = nullptr; data_sz = 0;
-        }
-        uint64_t head() const { uint64_t h = meta->data_head; __sync_synchronize(); return h; }
-        void set_tail(uint64_t t) { __sync_synchronize(); meta->data_tail = t; }
-    };
 
     struct SampleParser {
         uint64_t sample_type{0};
@@ -276,7 +443,6 @@ private:
         static inline uint64_t r64(const uint8_t*& p){ uint64_t v; std::memcpy(&v,p,8); p+=8; return v; }
         static inline uint32_t r32(const uint8_t*& p){ uint32_t v; std::memcpy(&v,p,4); p+=4; return v; }
 
-        // Parse to stack + leaf ip + weight (period)
         void parse_to_stack(const uint8_t* payload, size_t len,
                             std::vector<uint64_t>& out_stack,
                             uint64_t& out_leaf_ip,
@@ -326,7 +492,6 @@ private:
         int fd{-1};
         PerfRB rb;
         SampleParser parser;
-        bool ok{false};
 
         bool open(StreamKind k, bool use_lbr, bool user_only, bool inherit, int freq_hz,
                   pid_t attach_pid, int attach_cpu, bool time_task_clock) {
@@ -348,7 +513,7 @@ private:
             } else {
                 a.type = PERF_TYPE_HARDWARE;
                 a.config = PERF_COUNT_HW_CPU_CYCLES;
-                a.precise_ip = 2; // try precise attribution
+                a.precise_ip = 2;
                 a.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_PERIOD;
             }
 
@@ -372,7 +537,6 @@ private:
             parser.sample_type = a.sample_type;
             parser.branch_sample_type = a.branch_sample_type;
             parser.using_lbr = use_lbr;
-            ok = true;
             return true;
         }
 
@@ -394,13 +558,12 @@ private:
                             on_sample(parser, rec + sizeof(perf_event_header), sz - sizeof(perf_event_header));
                             break;
                         case PERF_RECORD_LOST: {
-                            // u64 id; u64 lost;
                             const uint8_t* p = rec + sizeof(perf_event_header);
                             uint64_t id, lost; std::memcpy(&id, p, 8); p += 8; std::memcpy(&lost, p, 8);
                             on_lost(lost);
                             break;
                         }
-                        default: break; // ignore others
+                        default: break;
                     }
                 };
 
@@ -424,7 +587,6 @@ private:
         }
     };
 
-    // ---------- internal ops ----------
     void drain_all_() {
         auto on_sample = [&](Stream& s, const SampleParser& parser,
                              const uint8_t* payload, size_t len) {
@@ -433,7 +595,7 @@ private:
             parser.parse_to_stack(payload, len, stack, leaf, w);
             if (w == 0) w = 1;
 
-            const std::string fn = func_key_(leaf);
+            const std::string fn = dwfl_.func_key(leaf);
             if (s.kind == StreamKind::TimeNS) {
                 func_time_ns_[fn] += w;
                 total_time_ns_    += w;
@@ -454,69 +616,25 @@ private:
         );
     }
 
-    std::string func_key_(uint64_t ip) const {
-        Dl_info info{};
-        if (dladdr(reinterpret_cast<void*>(ip), &info) && info.dli_fname) {
-            std::string mod = basename_of(info.dli_fname);
-            std::string name = info.dli_sname ? demangle(info.dli_sname) : std::string();
-            if (!name.empty()) return mod.empty() ? name : (mod + "!" + name);
-        }
-        char b[32]; std::snprintf(b, sizeof(b), "0x%llx", (unsigned long long)ip);
-        return b;
-    }
-    std::string frame_label_(uint64_t ip) const {
-        Dl_info info{};
-        if (dladdr(reinterpret_cast<void*>(ip), &info) && info.dli_fname) {
-            std::string mod = basename_of(info.dli_fname);
-            std::string name;
-            if (info.dli_sname) {
-                name = demangle(info.dli_sname);
-                uintptr_t off = uintptr_t(ip) - uintptr_t(info.dli_saddr);
-                if (off) { char buf[32]; std::snprintf(buf, sizeof(buf), "+0x%zx", size_t(off)); name += buf; }
-            } else {
-                uintptr_t off = uintptr_t(ip) - uintptr_t(info.dli_fbase);
-                char buf[48]; std::snprintf(buf, sizeof(buf), "0x%zx", size_t(off));
-                name = buf;
-            }
-            return mod.empty() ? name : (mod + "!" + name);
-        }
-        char b[32]; std::snprintf(b, sizeof(b), "0x%llx", (unsigned long long)ip);
-        return b;
-    }
-
 private:
     Options opt_;
     pid_t attach_pid_{0};
     int   attach_cpu_{-1};
     bool  inherit_{false};
 
-    // Two event streams
     Stream time_{}, cycles_{};
+    DwflSymbolizer dwfl_;
 
-    // Aggregation
     std::unordered_map<std::string, __uint128_t> func_time_ns_;
     std::unordered_map<std::string, __uint128_t> func_cycles_;
-    std::unordered_map<std::vector<uint64_t>, __uint128_t,
-                       struct HashVec {
-                           size_t operator()(const std::vector<uint64_t>& v) const {
-                               size_t h = 1469598103934665603ull;
-                               for (auto x : v) { h ^= x + 0x9e3779b97f4a7c15ull + (h<<6) + (h>>2); }
-                               return h;
-                           }
-                       },
-                       struct EqVec { bool operator()(const std::vector<uint64_t>& a,
-                                                     const std::vector<uint64_t>& b) const {
-                                              return a == b;
-                                          } }
-                       > stacks_time_;
-
+    std::unordered_map<std::vector<uint64_t>, __uint128_t, HashVec, EqVec> stacks_time_;
     __uint128_t total_time_ns_{0}, total_cycles_{0};
-    uint64_t    lost_time_{0}, lost_cycles_{0};
+    uint64_t    lost_time_{0},   lost_cycles_{0};
 
     std::chrono::steady_clock::time_point t0_{}, t1_{};
 };
 
-// ---------- Demo workload + CLI parser (example only) ----------
+// --------------------- Demo workload + CLI (example) ---------------------
 static inline uint64_t hot_work(uint64_t n) {
     volatile uint64_t s = 0;
     for (uint64_t i = 0; i < n; ++i) {
@@ -593,10 +711,9 @@ int main(int argc, char** argv) {
     XeonProfiler prof(opt);
     if (!prof.setup()) return 1;
 
-    // Warm-up (not measured)
+    // Warm-up
     hot_work(2'000'000);
 
-    // Measure just the demo region; in real code, simply call start/stop around your hot path.
     prof.start();
     mark_region();
     prof.stop();
