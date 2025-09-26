@@ -1,10 +1,10 @@
-// xeon_profiler_dwfl.cpp
-// Perf-based programmatic profiler for Intel Xeon Gold with DWARF symbolization (libdwfl).
-// This version includes a highly robust func_key() for stable function aggregation.
-//
-// Build:
-//   g++ -O2 -std=c++20 -fno-omit-frame-pointer \
-//       xeon_profiler_dwfl.cpp -ldw -lelf -ldl -o xeon_profiler_dwfl
+// xeon_profiler_dwfl_safe.cpp
+// Perf-based profiler (Xeon-friendly) with VERY robust DWFL symbolization.
+// Key hardening:
+//  - Never call dwfl_module_* unless mod!=nullptr AND dwfl_module_getelf(mod)!=nullptr
+//  - Skip bracketed pseudo-modules ([vdso], [anon], [kernel], etc.) for DWFL calls
+//  - Fallback to dladdr() → "module!0xADDR" for everything else
+//  - Guard every pointer, add caching, and sanitize names
 
 #define _GNU_SOURCE
 #include <linux/perf_event.h>
@@ -50,8 +50,15 @@ static std::string basename_of(const char* path) {
     const char* slash = std::strrchr(path, '/');
     return slash ? std::string(slash + 1) : std::string(path);
 }
+static inline bool is_bracketed_module_name(const char* modname) {
+    return modname && modname[0] == '['; // [vdso], [kernel], [anon], etc.
+}
+static std::string hex_addr(uint64_t ip) {
+    char b[32]; std::snprintf(b, sizeof(b), "0x%llx", (unsigned long long)ip);
+    return b;
+}
 
-// --------------------- DWARF Symbolizer (libdwfl) ---------------------
+// =================== DWARF Symbolizer (SAFE) ===================
 class DwflSymbolizer {
 public:
     DwflSymbolizer() : dwfl_(nullptr) {}
@@ -60,7 +67,7 @@ public:
     bool init_for_self() {
         Dwfl_Callbacks cb{};
         cb.find_elf       = dwfl_linux_proc_find_elf;
-        cb.find_debuginfo = dwfl_standard_find_debuginfo; // .gnu_debuglink, build-id, DEBUGINFOD_URLS
+        cb.find_debuginfo = dwfl_standard_find_debuginfo;
         dwfl_ = dwfl_begin(&cb);
         if (!dwfl_) return false;
         if (dwfl_linux_proc_report(dwfl_, getpid()) != 0) return false;
@@ -68,74 +75,51 @@ public:
         return true;
     }
 
-    // Human-readable frame label "module!function+0xOFF" for stacks.
+    // Full label for stacks: "module!function+0xOFF" or fallbacks.
     std::string frame_label(uint64_t ip) const {
-        if (!dwfl_) return hex_addr_(ip);
-        Dwfl_Module* mod = dwfl_addrmodule(dwfl_, (Dwarf_Addr)ip);
-        const char* modname = module_name_(mod);
-        std::string mshort = mod_basename_(modname);
-
-        // Prefer function symbol
-        std::string canon = function_name_with_offset_(mod, ip, /*want_offset=*/true);
-        if (!canon.empty()) return mshort.empty() ? canon : (mshort + "!" + canon);
-
-        // Fallback: module!0xADDR
-        if (!mshort.empty()) return mshort + "!" + hex_addr_(ip);
-        return hex_addr_(ip);
+        // Try safe DWFL path; otherwise fallback.
+        std::string mod, func_with_off;
+        if (safe_lookup_(ip, /*want_offset=*/true, mod, func_with_off)) {
+            if (!func_with_off.empty()) return mod.empty() ? func_with_off : (mod + "!" + func_with_off);
+            if (!mod.empty()) return mod + "!" + hex_addr(ip);
+            return hex_addr(ip);
+        }
+        // fallback via dladdr
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(ip), &info) && info.dli_fname) {
+            std::string m = basename_of(info.dli_fname);
+            return m.empty() ? hex_addr(ip) : (m + "!" + hex_addr(ip));
+        }
+        return hex_addr(ip);
     }
 
-    // ======= ROBUST FUNCTION KEY =======
-    //
-    // Returns a canonical aggregation key "module!function" with:
-    //  - DWARF/symtab based resolution
-    //  - demangling
-    //  - normalization of compiler suffixes (.cold/.isra/.constprop/.part/.clone/.llvm/plt/@plt/etc.)
-    //  - no +offset
-    //  - stable grouping for PLT/IFUNC stubs
-    //
+    // Canonical function key: "module!function" (no offsets), normalized.
     std::string func_key(uint64_t ip) const {
-        if (!dwfl_) return fallback_func_key_(ip);
-
-        // Cache
         auto it = cache_.find(ip);
         if (it != cache_.end()) return it->second;
 
-        Dwfl_Module* mod = dwfl_addrmodule(dwfl_, (Dwarf_Addr)ip);
-        const char* modname = module_name_(mod);
-        std::string mshort = mod_basename_(modname);
-
-        // Step 1: Resolve containing function symbol using addrinfo (strongest)
-        std::string fname;
-        if (mod) {
-            const char* nm_via_addrname = dwfl_module_addrname(mod, (Dwarf_Addr)ip);
-            if (nm_via_addrname && *nm_via_addrname) {
-                fname = demangle(nm_via_addrname);
+        std::string mod, func;
+        // Try DWFL (safe)
+        if (safe_lookup_(ip, /*want_offset=*/false, mod, func)) {
+            std::string key;
+            if (!func.empty()) {
+                key = mod.empty() ? func : (mod + "!" + func);
+            } else {
+                key = mod.empty() ? hex_addr(ip) : (mod + "!" + hex_addr(ip));
             }
-
-            // Try to nail the defining symbol (gives us start address & avoids PLT thunks)
-            GElf_Sym sym{}; GElf_Off symoff = 0;
-            if (dwfl_module_addrinfo(mod, (Dwarf_Addr)ip, &sym, &symoff, nullptr, nullptr, nullptr) == 0) {
-                // Prefer st_name if available; sometimes addrname returns section names/aliases
-                if (sym.st_name) {
-                    const char* tabnm = dwfl_module_getsym_info(mod, GELF_ST_BIND(sym.st_info), &sym, nullptr, nullptr, nullptr, nullptr)
-                                        ? nullptr : nullptr; // placeholder; we already have 'sym'
-                    // dwfl doesn't directly give the name here; use addrname again for user-facing,
-                    // but we already have one in fname. Keep as-is.
-                }
-            }
+            cache_.emplace(ip, key);
+            return key;
         }
 
-        // Step 2: Canonicalize the function name aggressively
-        std::string canon_func = canonicalize_function_(fname);
-
-        // If still empty, fall back to module!0xADDR (stable grouping by module)
-        std::string key;
-        if (!canon_func.empty()) {
-            key = mshort.empty() ? canon_func : (mshort + "!" + canon_func);
-        } else {
-            key = mshort.empty() ? hex_addr_(ip) : (mshort + "!" + hex_addr_(ip));
+        // Fallback: dladdr
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(ip), &info) && info.dli_fname) {
+            std::string m = basename_of(info.dli_fname);
+            std::string key = m.empty() ? hex_addr(ip) : (m + "!" + hex_addr(ip));
+            cache_.emplace(ip, key);
+            return key;
         }
-
+        std::string key = hex_addr(ip);
         cache_.emplace(ip, key);
         return key;
     }
@@ -150,99 +134,91 @@ private:
     }
     static std::string mod_basename_(const char* modname) {
         if (!modname) return {};
-        // Normalize special maps like [vdso], [kernel.kallsyms], [anon], etc.
-        if (modname[0] == '[') return std::string(modname); // keep bracketed names as-is
+        if (is_bracketed_module_name(modname)) return std::string(modname);
         return basename_of(modname);
     }
-    static std::string hex_addr_(uint64_t ip) {
-        char b[32]; std::snprintf(b, sizeof(b), "0x%llx", (unsigned long long)ip);
-        return b;
-    }
 
-    // Return demangled function + optional +offset.
-    std::string function_name_with_offset_(Dwfl_Module* mod, uint64_t ip, bool want_offset) const {
-        std::string out;
-        if (!mod) return out;
-
-        const char* nm = dwfl_module_addrname(mod, (Dwarf_Addr)ip);
-        if (nm && *nm) out = demangle(nm);
-
-        // If requested, append +offset within symbol
-        GElf_Sym sym{}; GElf_Off symoff;
-        if (dwfl_module_addrinfo(mod, (Dwarf_Addr)ip, &sym, &symoff, nullptr, nullptr, nullptr) == 0) {
-            if (want_offset && sym.st_value && (uint64_t)ip > sym.st_value) {
-                char buf[32];
-                std::snprintf(buf, sizeof(buf), "+0x%llx",
-                              (unsigned long long)((uint64_t)ip - (uint64_t)sym.st_value));
-                out += buf;
-            }
-        }
-        return out;
-    }
-
-    // ---- Canonicalization helpers for function names ----
-    static inline void erase_suffix(std::string& s, std::string_view sv) {
-        if (s.size() >= sv.size() && s.compare(s.size()-sv.size(), sv.size(), sv) == 0) {
-            s.erase(s.size()-sv.size());
-        }
-    }
+    // Canonicalize function names (strip suffix noise).
     static inline void remove_all(std::string& s, std::string_view what) {
-        for (;;) {
-            auto p = s.find(what);
-            if (p == std::string::npos) break;
-            s.erase(p, what.size());
-        }
+        for (;;) { auto p = s.find(what); if (p==std::string::npos) break; s.erase(p, what.size()); }
     }
     static inline void strip_after(std::string& s, char ch) {
-        auto p = s.find(ch);
-        if (p != std::string::npos) s.resize(p);
+        auto p = s.find(ch); if (p != std::string::npos) s.resize(p);
     }
-
-    // Heuristically strip compiler/linker clutter to get a *stable* function identity.
     static std::string canonicalize_function_(std::string name) {
         if (name.empty()) return name;
-
-        // Drop any offset suffix produced upstream (just in case).
-        strip_after(name, '+'); // remove "+0x…"
-
-        // Normalize common GCC/Clang/Glibc suffixes:
-        static const std::string kill_suffixes[] = {
+        strip_after(name, '+'); // drop offsets if any
+        // strip common compiler/linker noise
+        static const std::string junk[] = {
             ".cold", ".part", ".clone", ".plt", "._plt", "@plt",
-            // OMP/outlined
             ".__omp_outlined__", ".__omp_outlined.", "._omp_fn.", "._omp_fn",
-            // GCC transforms
             ".isra.", ".constprop.", ".constprop", ".isra", ".llvm.", ".lto_priv.", ".lto_priv",
-            // thunk-like markers (various toolchains)
             ".thunk", "_thunk", " thunk"
         };
-        for (const auto& k : kill_suffixes) {
-            // Remove occurrences anywhere (safer than only trailing)
-            remove_all(name, k);
-        }
-
-        // Remove GLIBC/GLIBCXX version suffixes on C symbols if any made it through demangle
-        strip_after(name, '@');
-
-        // Trim whitespace if any artifacts
-        while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
-
+        for (const auto& j : junk) remove_all(name, j);
+        strip_after(name, '@'); // GLIBC versioning if it sneaks in
+        while (!name.empty() && isspace((unsigned char)name.back())) name.pop_back();
         return name;
     }
 
-    // Last-resort key if DWFL failed: try module via dladdr, then address.
-    static std::string fallback_func_key_(uint64_t ip) {
-        Dl_info info{};
-        if (dladdr(reinterpret_cast<void*>(ip), &info) && info.dli_fname) {
-            std::string mod = basename_of(info.dli_fname);
-            char b[32]; std::snprintf(b, sizeof(b), "0x%llx", (unsigned long long)ip);
-            return mod.empty() ? std::string(b) : (mod + "!" + b);
+    // SAFE DWFL lookup. Returns true if DWFL was used (even if function empty).
+    // Outputs:
+    //   mod_out  = module basename or bracketed name (never nullptr)
+    //   func_out = demangled function (canonicalized), "" if unknown
+    bool safe_lookup_(uint64_t ip, bool want_offset,
+                      std::string& mod_out, std::string& func_out) const {
+        mod_out.clear(); func_out.clear();
+        if (!dwfl_) return false;
+
+        Dwfl_Module* mod = dwfl_addrmodule(dwfl_, (Dwarf_Addr)ip);
+        const char* modname = module_name_(mod);
+        mod_out = mod_basename_(modname);
+
+        // If no module OR pseudo-module (e.g., [vdso], [anon]), do not call DWFL module APIs.
+        if (!mod || is_bracketed_module_name(modname)) return true; // DWFL used, but no symbolization
+
+        // Only call deeper DWFL APIs if module has an ELF handle.
+        Elf* elf = dwfl_module_getelf(mod, nullptr);
+        if (!elf) {
+            // We still can try addrname; in practice addrname may work even without ELF,
+            // but to be maximally safe (given your crash), guard it behind elf!=nullptr.
+            return true; // DWFL used; no function
         }
-        char b[32]; std::snprintf(b, sizeof(b), "0x%llx", (unsigned long long)ip);
-        return b;
+
+        // Get a function name
+        const char* nm = dwfl_module_addrname(mod, (Dwarf_Addr)ip);
+        if (nm && *nm) {
+            std::string pretty = demangle(nm);
+            if (want_offset) {
+                // Append +offset if we can determine it safely
+                GElf_Sym sym{}; GElf_Off off = 0;
+                if (dwfl_module_addrinfo(mod, (Dwarf_Addr)ip, &sym, &off, nullptr, nullptr, nullptr) == 0) {
+                    if (sym.st_value && (uint64_t)ip > sym.st_value) {
+                        char buf[32];
+                        std::snprintf(buf, sizeof(buf), "+0x%llx",
+                                      (unsigned long long)((uint64_t)ip - (uint64_t)sym.st_value));
+                        pretty += buf;
+                    }
+                }
+            }
+            func_out = want_offset ? pretty : canonicalize_function_(pretty);
+            return true;
+        }
+
+        // As a last DWFL attempt: try addrinfo just to validate symbol range (still guarded by elf!=nullptr)
+        if (!want_offset) {
+            GElf_Sym sym{}; GElf_Off off = 0;
+            if (dwfl_module_addrinfo(mod, (Dwarf_Addr)ip, &sym, &off, nullptr, nullptr, nullptr) == 0) {
+                if (sym.st_name) {
+                    // We don't have the name string here easily; leave func empty.
+                }
+            }
+        }
+        return true;
     }
 };
 
-// --------------------- Ring Buffer ---------------------
+// =================== Perf ring & sampling ===================
 struct PerfRB {
     int fd{-1};
     void* base{nullptr};
@@ -270,7 +246,6 @@ struct PerfRB {
     void set_tail(uint64_t t) { __sync_synchronize(); meta->data_tail = t; }
 };
 
-// --------------------- Hash helpers ---------------------
 struct HashVec {
     size_t operator()(const std::vector<uint64_t>& v) const {
         size_t h = 1469598103934665603ull;
@@ -282,7 +257,7 @@ struct EqVec {
     bool operator()(const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) const { return a == b; }
 };
 
-// --------------------- Profiler (drop-in class) ---------------------
+// =================== Profiler class ===================
 class XeonProfiler {
 public:
     struct Options {
@@ -290,7 +265,7 @@ public:
         int   freq_hz         = 2000;
         bool  include_kernel  = false;
         bool  force_no_lbr    = false;
-        bool  time_task_clock = true;   // TASK_CLOCK vs CPU_CLOCK
+        bool  time_task_clock = true; // TASK_CLOCK vs CPU_CLOCK
         int   top_n           = 25;
         std::string collapsed_out = "stacks.collapsed";
     };
@@ -299,7 +274,7 @@ public:
 
     bool setup() {
         if (!dwfl_.init_for_self()) {
-            std::cerr << "[warn] Failed to initialize libdwfl; symbol names may be poorer.\n";
+            std::cerr << "[warn] libdwfl init failed; names may be poor.\n";
         }
         attach_pid_ = (opt_.scope == Options::Scope::Process ? getpid() : 0);
         attach_cpu_ = -1;
@@ -312,13 +287,11 @@ public:
                             !opt_.include_kernel, inherit_, opt_.freq_hz,
                             attach_pid_, attach_cpu_, opt_.time_task_clock)) {
                 perror("perf_event_open(time)");
-                std::cerr << "Hint: check perf_event_paranoid and LBR availability.\n";
                 return false;
             } else {
-                std::cerr << "[info] time: LBR unavailable; using frame-pointer CALLCHAIN.\n";
+                std::cerr << "[info] time: LBR unavailable; using CALLCHAIN.\n";
             }
         }
-
         if (!cycles_.open(StreamKind::Cycles, !opt_.force_no_lbr,
                           !opt_.include_kernel, inherit_, opt_.freq_hz,
                           attach_pid_, attach_cpu_, /*time_task*/ true)) {
@@ -326,10 +299,9 @@ public:
                               !opt_.include_kernel, inherit_, opt_.freq_hz,
                               attach_pid_, attach_cpu_, /*time_task*/ true)) {
                 perror("perf_event_open(cycles)");
-                std::cerr << "Hint: check perf_event_paranoid and LBR availability.\n";
                 return false;
             } else {
-                std::cerr << "[info] cycles: LBR unavailable; using frame-pointer CALLCHAIN.\n";
+                std::cerr << "[info] cycles: LBR unavailable; using CALLCHAIN.\n";
             }
         }
         return true;
@@ -374,12 +346,12 @@ public:
                                ? (100.0L * to_ld(total_time_ns_) / (wall_ns ? wall_ns : 1)) : -1.0L;
 
         os << "========== Hot Functions (Top " << opt_.top_n << ") ==========\n";
-        os << "  time = ns from " << (opt_.time_task_clock ? "TASK_CLOCK (on-CPU task time)" : "CPU_CLOCK")
-           << ", cycles = HW CPU cycles (precise_ip requested)\n";
+        os << "  time: " << (opt_.time_task_clock ? "TASK_CLOCK" : "CPU_CLOCK")
+           << " (ns), cycles: HW CPU cycles\n";
         os << "  scope: " << (opt_.scope == Options::Scope::Thread ? "thread" : "process")
            << (opt_.include_kernel ? " (user+kernel)" : " (user-only)") << ", freq=" << opt_.freq_hz << " Hz\n";
-        if (util_pct >= 0) os << "  region wall time: " << wall_ms << " ms, CPU util: " << (double)util_pct << "%\n";
-        else               os << "  region wall time: " << wall_ms << " ms\n";
+        if (util_pct >= 0) os << "  wall: " << wall_ms << " ms, CPU util: " << (double)util_pct << "%\n";
+        else               os << "  wall: " << wall_ms << " ms\n";
         if (lost_time_ || lost_cycles_) {
             os << "  [warn] Lost records: time=" << lost_time_ << ", cycles=" << lost_cycles_
                << " (increase ring buffer or lower --freq)\n";
@@ -622,6 +594,7 @@ private:
     int   attach_cpu_{-1};
     bool  inherit_{false};
 
+    enum class StreamKind { TimeNS, Cycles };
     Stream time_{}, cycles_{};
     DwflSymbolizer dwfl_;
 
@@ -630,11 +603,10 @@ private:
     std::unordered_map<std::vector<uint64_t>, __uint128_t, HashVec, EqVec> stacks_time_;
     __uint128_t total_time_ns_{0}, total_cycles_{0};
     uint64_t    lost_time_{0},   lost_cycles_{0};
-
     std::chrono::steady_clock::time_point t0_{}, t1_{};
 };
 
-// --------------------- Demo workload + CLI (example) ---------------------
+// =================== Demo workload + CLI ===================
 static inline uint64_t hot_work(uint64_t n) {
     volatile uint64_t s = 0;
     for (uint64_t i = 0; i < n; ++i) {
@@ -711,7 +683,7 @@ int main(int argc, char** argv) {
     XeonProfiler prof(opt);
     if (!prof.setup()) return 1;
 
-    // Warm-up
+    // Warm-up (not measured)
     hot_work(2'000'000);
 
     prof.start();
